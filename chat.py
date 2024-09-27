@@ -1,67 +1,129 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+import os
+import re
+
+# Limit the number of threads PyTorch uses
+torch.set_num_threads(4)  # Adjust based on your CPU cores
+print(f"Using {torch.get_num_threads()} threads for PyTorch.")
 
 # Define the apply_chat_template function
-def apply_chat_template(messages, return_tensors="pt"):
-    # Combine the messages into a single prompt string
-    prompt = ""
-    for message in messages:
-        role = message.get("role", "")
-        content = message.get("content", "")
-        prompt += f"{role.capitalize()}: {content}\n"
-    # Add the assistant prompt
-    prompt += "Assistant:"
+def apply_chat_template(messages, tokenizer, return_tensors="pt"):
+    if not messages:
+        return None  # Handle empty messages gracefully
+
+    # Extract the last user message
+    last_user_message = messages[-1]['content']
+    # Construct the prompt using "Q:" and "A:" format
+    prompt = f"Q: {last_user_message}\nA:"
+
+    print(f"Constructed prompt: {prompt}")  # Verbose logging
+
+    return tokenizer(
+        prompt, 
+        return_tensors=return_tensors, 
+        truncation=True, 
+        max_length=512,  # Adjust as needed
+        padding=True
+    )
+
+# Function to clean the model's response
+def clean_response(response):
+    # Remove numbered lists (e.g., "1. ")
+    response = re.sub(r'^\d+\.\s*', '', response, flags=re.MULTILINE)
     
-    # Tokenize the prompt
-    return tokenizer(prompt, return_tensors=return_tensors)
+    # Remove trailing incomplete sentences or asterisks
+    response = re.sub(r'\*.*$', '', response, flags=re.DOTALL)
+    
+    # Optionally, remove any residual special characters except basic punctuation
+    response = re.sub(r'[^\w\s\.,!?]', '', response)
+    
+    return response.strip()
 
-# Load the tokenizer and model
-model_id = "/Users/dana/dev/llamaChat/llama-3.2-1B-Instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+# Function to load model and tokenizer without dynamic quantization
+def load_model_and_tokenizer():
+    model_path = "/home/art/dev/llama/llama-3.2-1B"  # Update if using a different model
+    print(f"Attempting to load model from: {model_path}")
+    
+    if not os.path.exists(model_path) and not os.path.exists(os.path.join(model_path, "config.json")):
+        raise ValueError(f"Model path does not exist or is invalid: {model_path}")
 
-# Ensure the tokenizer has an eos_token_id
-if tokenizer.eos_token_id is None:
-    tokenizer.eos_token_id = tokenizer.pad_token_id
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    print("Fast tokenizer loaded successfully")
 
-# Load the model with pad_token_id set to eos_token_id
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-    max_length=64,
-    pad_token_id=tokenizer.eos_token_id  # Explicitly set pad_token_id
-)
+    # Handle multiple eos_token_ids by selecting the first one
+    if isinstance(tokenizer.eos_token_id, list):
+        tokenizer.eos_token_id = tokenizer.eos_token_id[0]
+    elif tokenizer.eos_token_id is None:
+        tokenizer.eos_token_id = tokenizer.pad_token_id
+    print(f"eos_token_id: {tokenizer.eos_token_id}")
+
+    # Ensure pad_token_id is set to the first eos_token_id
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        print(f"pad_token_id was not set. Setting pad_token_id to eos_token_id: {tokenizer.pad_token_id}")
+    else:
+        print(f"pad_token_id: {tokenizer.pad_token_id}")
+
+    # Load the model
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float32,  # Use float32 for CPU
+        device_map="cpu",
+        low_cpu_mem_usage=True,
+        pad_token_id=tokenizer.pad_token_id
+    )
+    print("Model loaded successfully")
+
+    # Optionally apply dynamic quantization (commented out for testing)
+    # print("Applying dynamic quantization to the model...")
+    # model = torch.quantization.quantize_dynamic(
+    #     model, 
+    #     {torch.nn.Linear},  # Specify layers to quantize
+    #     dtype=torch.qint8
+    # )
+    # print("Dynamic quantization applied successfully")
+
+    # Check model configuration
+    config = AutoConfig.from_pretrained(model_path)
+    print(f"Model configuration:\n{config}")
+
+    return tokenizer, model
 
 # Function to generate response with error handling and attention mask
-def generate_response(messages):
+def generate_response(messages, tokenizer, model):
     try:
-        # Prepare the input by applying the chat template
-        inputs = apply_chat_template(messages, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(model.device)
-        attention_mask = inputs["attention_mask"].to(model.device)
+        inputs = apply_chat_template(messages, tokenizer, return_tensors="pt")
+        if inputs is None:
+            return "I'm here to help! How can I assist you today?"
+
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
         
-        print(f"Input IDs shape: {input_ids.shape}")
-        print(f"Attention Mask shape: {attention_mask.shape}")
+        print("Starting generation...")  # Verbose logging
+
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=64,        # Adjust for desired response length
+                do_sample=True,            # Enables sampling for diversity
+                temperature=0.6,           # Lowered for more coherent responses
+                top_p=0.9,                 # Nucleus sampling
+                top_k=50,                  # Limits sampling to top 50 tokens
+                repetition_penalty=1.1,    # Slightly discourages repetition
+                no_repeat_ngram_size=3,    # Prevents repeating trigrams
+                num_return_sequences=1,
+                pad_token_id=tokenizer.pad_token_id
+            )
         
-        # Generate outputs with attention_mask
-        outputs = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=512,
-            do_sample=True,
-            temperature=0.7
-        )
+        print("Generation completed.")  # Verbose logging
         
-        print(f"Outputs shape: {outputs.shape}")
-        print(f"Outputs tensor: {outputs}")
+        decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = decoded_output.strip()
+        response = clean_response(response)
         
-        # Decode the generated outputs
-        decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        
-        print(f"Decoded Outputs: {decoded_outputs}")
-        
-        # Assuming batch_size=1, extract the first (and only) response
-        response = decoded_outputs[0].split("Assistant:")[-1].strip()
+        print(f"Generated response: {response}")  # Verbose logging
         
         return response
     except Exception as e:
@@ -70,12 +132,26 @@ def generate_response(messages):
 
 # Main chat loop with history management
 def main():
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."}
-    ]
-    max_history = 5  # Adjust based on your requirements
+    print("Loading model and tokenizer...")
+    try:
+        tokenizer, model = load_model_and_tokenizer()
+        model.eval()  # Set model to evaluation mode
+        print("Model is in evaluation mode.")
+    except Exception as e:
+        print(f"Error loading model and tokenizer: {e}")
+        return
 
-    print("Welcome to the Llama-3.2-1B-Instruct chat! Type 'quit' to exit.")
+    # Initialize messages with an initial instruction
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a friendly and knowledgeable assistant. Provide clear and concise answers to the user's questions."
+        }
+    ]
+
+    max_history = 5  # Adjust based on memory constraints
+
+    print("Welcome to the Llama-3.2-1B chat! Type 'quit' to exit.")
 
     while True:
         user_input = input("You: ")
@@ -83,10 +159,12 @@ def main():
             break
 
         messages.append({"role": "user", "content": user_input})
-        response = generate_response(messages)
+        print("Generating response...")  # Verbose logging
+
+        response = generate_response(messages, tokenizer, model)
         messages.append({"role": "assistant", "content": response})
 
-        # Trim the history to maintain only the recent exchanges
+        # Trim history to maintain only recent exchanges
         if len(messages) > max_history + 1:
             messages = messages[:1] + messages[-max_history:]
 

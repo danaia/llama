@@ -5,5 +5,5 @@ venv/
 .env/
 
 # Ignore model.safetensors under llama-3.2-1B-Instruct directory
-llama-3.2-1B-Instruct/model.safetensors
+llama-3.2-1B/model.safetensors
 model/model.safetensors
