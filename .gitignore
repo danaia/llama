@@ -1,0 +1,9 @@
+# .gitignore
+
+# Ignore virtual environment directories
+venv/
+.env/
+
+# Ignore model.safetensors under llama-3.2-1B-Instruct directory
+llama-3.2-1B-Instruct/model.safetensors
+model/model.safetensors
